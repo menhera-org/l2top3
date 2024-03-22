@@ -1,0 +1,568 @@
+#!/bin/sh
+
+# Set the variables.
+
+L2TOP_INSTALL_DIR=/opt/l2top3
+
+if [ -z "$PATH" ] ; then
+    PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+else
+    PATH="${PATH}:/sbin:/bin:/usr/sbin:/usr/bin"
+fi
+
+export PATH
+
+[ -f "$L2TOP_IP_BIN" ] && [ -x "$L2TOP_IP_BIN" ] || L2TOP_IP_BIN=/sbin/ip
+if [ ! -x "$L2TOP_IP_BIN" ] && which ip >/dev/null 2>&1 ; then
+    L2TOP_IP_BIN=$( which ip )
+fi
+
+[ -n "$L2TOP_CONFIG_DIR" ] || L2TOP_CONFIG_DIR=/etc/l2top.d
+
+
+# Utility functions.
+fn_bin_exists() {
+    which "$1" >/dev/null 2>&1
+}
+
+fn_syslog() {
+    local prio
+    local msg
+    if [ $# -lt 2 ] ; then
+        echo "Usage: fn_syslog err|warning|notice|info|debug <msg> ..." >&2
+        return 1
+    fi
+
+    prio=$1
+    shift >/dev/null
+    msg="$@"
+
+    case "$prio" in
+        error)
+            prio=err
+            ;;
+        warn)
+            prio=warning
+            ;;
+        err|warning|notice|info|debug)
+            ;;
+        *)
+            prio=info
+            ;;
+    esac
+
+    logger --id=$$ -t l2top3 -p "daemon.${prio}" "$msg"
+}
+
+fn_log_err() {
+    fn_syslog err "$@"
+}
+
+fn_log_warning() {
+    fn_syslog warning "$@"
+}
+
+fn_log_notice() {
+    fn_syslog notice "$@"
+}
+
+fn_log_info() {
+    fn_syslog info "$@"
+}
+
+fn_log_debug() {
+    fn_syslog debug "$@"
+}
+
+fn_die() {
+  fn_log_err "$@"
+  exit 1
+}
+
+fn_check_for_root() {
+    if [ "$( id -u )" -eq 0 ] ; then
+        return 0
+    else
+        fn_log_warning "${0}: Not running as root (UID 0)."
+        return 1
+    fi
+}
+
+# Miscellaneous interface functions.
+fn_if_exists() {
+    "$L2TOP_IP_BIN" link show "$1" >/dev/null 2>&1
+}
+
+# L2TP functions.
+fn_l2tp_show_tunnel() {
+    "$L2TOP_IP_BIN" l2tp show tunnel tunnel_id "$1" 2>/dev/null
+}
+
+fn_l2tp_show_session() {
+    "$L2TOP_IP_BIN" l2tp show session tunnel_id "$1" session_id "$2" 2>/dev/null
+}
+
+fn_l2tp_tunnel_exists() {
+    [ -n "$( fn_l2tp_show_tunnel "$1" | grep -Ei "tunnel\s+${1}" )" ]
+}
+
+fn_l2tp_session_exists() {
+   [ -n "$( fn_l2tp_show_session "$1" "$2" | grep -Ei "tunnel\s+${1}" | grep -Ei "session\s+${2}" )" ]
+}
+
+fn_l2tp_add_tunnel() {
+    local ip_version
+    local tunnel_id
+    local remote_addr
+    local local_addr
+    if [ $# -ne 3 ] ; then
+        echo "Usage: fn_l2tp_add_tunnel ipv4|ipv6 <tunnel_id> <remote_addr>" >&2
+        return 1
+    fi
+
+    ip_version=$1
+    tunnel_id=$2
+    remote_addr=$3
+
+    case "$ip_version" in
+        ipv4)
+            local_addr="0.0.0.0"
+            ;;
+        ipv6)
+            local_addr=::
+            ;;
+        *)
+            fn_log_err "${0}: Invalid IP version"
+            return 1
+            ;;
+    esac
+
+    "$L2TOP_IP_BIN" l2tp add tunnel \
+        remote "$remote_addr" \
+        local "$local_addr" \
+        tunnel_id "$tunnel_id" \
+        peer_tunnel_id "$tunnel_id" \
+        encap ip \
+    || {
+        fn_log_err "${0}: Faild to add tunnel '${tunnel_id}' (remote_addr=${remote_addr})"
+        return 1
+    }
+}
+
+fn_l2tp_add_session() {
+    local if_name
+    local tunnel_id
+    local session_id
+    if [ $# -ne 3 ] ; then
+        echo "Usage: fn_l2tp_add_session <if_name> <tunnel_id> <session_id>" >&2
+        return 1
+    fi
+    
+    if_name=$1
+    tunnel_id=$2
+    session_id=$3
+
+    "$L2TOP_IP_BIN" l2tp add session \
+        name "$if_name" \
+        tunnel_id "$tunnel_id" \
+        session_id "$session_id" \
+        peer_session_id "$session_id" \
+    || {
+        fn_log_err "${0}: Failed to add session '${session_id}' (if_name=${if_name}) for tunnel '${tunnel_id}'"
+        return 1
+    }
+}
+
+fn_l2tp_del_session() {
+    local tunnel_id
+    local session_id
+    if [ $# -ne 2 ] ; then
+        echo "Usage: fn_l2tp_del_session <tunnel_id> <session_id>" >&2
+        return 1
+    fi
+
+    tunnel_id=$1
+    session_id=$2
+    fn_l2tp_session_exists "$tunnel_id" "$session_id" || return 0
+
+    "$L2TOP_IP_BIN" l2tp del session \
+        tunnel_id "$tunnel_id" \
+        session_id "$session_id" \
+    || {
+        fn_log_err "${0}: Failed to delete session '${session_id}' for tunnel '${tunnel_id}'"
+        return 1
+    }
+}
+
+fn_l2tp_del_tunnel() {
+    local tunnel_id
+    if [ $# -ne 1 ] ; then
+        echo "Usage: fn_l2tp_del_tunnel <tunnel_id>" >&2
+        return 1
+    fi
+
+    tunnel_id=$1
+    fn_l2tp_tunnel_exists "$tunnel_id" || return 0
+
+    "$L2TOP_IP_BIN" l2tp del tunnel \
+        tunnel_id "$tunnel_id" \
+    || {
+        fn_log_err "${0}: Failed to delete tunnel"
+        return 1
+    }
+}
+
+# Returns 2 for invalid invocations, and 1 for an error.
+fn_l2tp_add() {
+    local tunnel_id
+    local remote_addr
+    local session_id
+    local if_name
+    local ip_version
+    local arg
+    local next_arg
+
+    while [ $# -gt 0 ] ; do
+        arg=$1
+        shift
+
+        if [ -n "$next_arg" ] ; then
+            case "$next_arg" in
+                if_name)
+                    if_name=$arg
+                    ;;
+                session_id)
+                    session_id=$arg
+                    ;;
+                tunnel_id)
+                    tunnel_id=$arg
+                    ;;
+                remote_addr)
+                    remote_addr=$arg
+                    ;;
+            esac
+
+            next_arg=
+            continue
+        fi
+
+        case "$arg" in
+            --if-name|-i)
+                next_arg=if_name
+                ;;
+            --session-id|-s)
+                next_arg=session_id
+                ;;
+            --tunnel-id|-t)
+                next_arg=tunnel_id
+                ;;
+            --remote-addr|-r)
+                next_arg=remote_addr
+                ;;
+            --ipv4|-4)
+                ip_version=ipv4
+                ;;
+            --ipv6|-6)
+                ip_version=ipv6
+                ;;
+            *)
+                fn_log_warning "${0}: Invalid argument"
+                return 2
+                ;;
+        esac
+    done
+
+    if [ -n "$next_arg" ] || [ -z "$tunnel_id" ] || [ -z "$remote_addr" ] || [ -z "$ip_version" ] ; then
+        fn_log_warning "${0}: Invalid invocation"
+        return 2
+    fi
+
+    if [ -z "$if_name" ] ; then
+        if_name="l2tp${tunnel_id}"
+    fi
+
+    if [ -z "$session_id" ]; then
+        session_id=$tunnel_id
+    fi
+
+    fn_check_for_root || {
+        return 1
+    }
+
+    fn_l2tp_add_tunnel "$ip_version" "$tunnel_id" "$remote_addr" \
+    && fn_l2tp_add_session "$if_name" "$tunnel_id" "$session_id" || {
+        return 1
+    }
+}
+
+fn_l2tp_del() {
+    local tunnel_id
+    if [ $# -ne 1 ] ; then
+        echo "Usage: fn_l2tp_del <tunnel_id>" >&2
+        return 1
+    fi
+
+    fn_check_for_root || {
+        return 1
+    }
+
+    # Deleting a tunnel also deletes its sessions.
+    tunnel_id=$1
+    fn_l2tp_del_tunnel "$tunnel_id" || {
+        return 1
+    }
+}
+
+fn_addr_resolve() {
+    local hostname
+    local command
+    if [ $# -ne 2 ] ; then
+        echo "Usage: fn_addr_resolve -4|-6 <hostname>" >&2
+        return 1
+    fi
+
+    case "$1" in
+        -4|--ipv4)
+            command=ahostsv4
+            ;;
+        -6|--ipv6)
+            command=ahostsv6
+            ;;
+        *)
+            fn_log_warning "${0}: Invalid IP version"
+            return 1
+            ;;
+    esac
+    hostname=$2
+
+    getent "$command" "$hostname" | grep RAW | head -n 1 | awk '{print $1}'
+}
+
+# Returns 0 if changed, 1 otherwise.
+fn_addr_is_changed() {
+    local entry_name
+    local addr
+    local cached_addr
+    local filename
+    if [ $# -ne 2 ] ; then
+        echo "Usage: fn_addr_is_changed <entry_name> <address>" >&2
+        return 1
+    fi
+
+    entry_name=$1
+    addr=$2
+
+    fn_check_for_root || {
+        return 1
+    }
+
+    filename=/run/l2top3.${entry_name}.cache
+    if [ ! -e "$filename" ] ; then
+        echo "$addr" > "$filename"
+        return 0
+    fi
+
+    cached_addr=$( cat "$filename" )
+    if [ "$addr" = "$cached_addr" ] ; then
+        return 1
+    fi
+
+    echo "$addr" > "$filename"
+    return 0
+}
+
+fn_load_config() {
+    unset IP_VERSION
+    unset TUNNEL_ID
+    unset REMOTE
+    unset MTU
+
+    . "$1"
+
+    case "$IP_VERSION" in
+        4|6)
+            ;;
+        *)
+            fn_log_err "${0}: Invalid configuration: IP_VERSION is invalid: '${IP_VERSION}'"
+            return 1
+            ;;
+    esac
+
+    [ "$TUNNEL_ID" -ge 1 ] || {
+        fn_log_err "${0}: Invalid configuration: TUNNEL_ID is invalid: '${TUNNEL_ID}'"
+        return 1
+    }
+    if [ -z "$REMOTE" ] ; then
+        fn_log_err "${0}: Invalid configuration: REMOTE is undefined"
+        return 1
+    fi
+    if [ -z "$MTU" ] ; then
+        MTU=1500
+    fi
+    [ "$MTU" -ge 1280 ] || {
+        fn_log_err "${0}: Invalid configuration: MTU is invalid"
+        return 1
+    }
+}
+
+fn_setup() {
+    local config
+    local remote_addr
+    local ip_version_option
+    # IF_NAME is a global
+
+    for config in $L2TOP_CONFIG_DIR/*.conf ; do
+        [ -f "$config" ] || continue
+        IF_NAME=${config##*/}
+        IF_NAME=${IF_NAME%.conf}
+        fn_log_info "${0}: interface name: '${IF_NAME}'"
+        fn_load_config "$config" || continue
+        if [ "$IP_VERSION" -eq 4 ] ; then
+            ip_version_option="-4"
+        else
+            ip_version_option="-6"
+        fi
+
+        remote_addr=$( fn_addr_resolve $ip_version_option "$REMOTE" )
+        if [ -z "$remote_addr" ] ; then
+            fn_log_warning "${0}: Failed to resolve remote hostname: '$REMOTE'"
+            continue
+        fi
+
+        if fn_addr_is_changed "$IF_NAME" "$remote_addr" ; then
+            :
+        elif fn_if_exists "$IF_NAME" ; then
+            continue
+        fi
+        fn_l2tp_del "$TUNNEL_ID"
+        sleep 1
+        fn_l2tp_add $ip_version_option --if-name "$IF_NAME" --tunnel-id "$TUNNEL_ID" --remote-addr "$remote_addr" || continue
+        "$L2TOP_IP_BIN" link set "$IF_NAME" mtu "$MTU"
+        fn_log_info "${0}: Tunnel interface '${IF_NAME}' (tunnel ID=${TUNNEL_ID}) created"
+    done
+    return 0
+}
+
+fn_stop() {
+    local config
+    # IF_NAME is a global
+
+    for config in $L2TOP_CONFIG_DIR/*.conf ; do
+        [ -f "$config" ] || continue
+        IF_NAME=${config##*/}
+        IF_NAME=${IF_NAME%.conf}
+        fn_load_config "$config" || continue
+        fn_l2tp_del "$TUNNEL_ID" || continue
+        sleep 1
+        if fn_if_exists "$IF_NAME" ; then
+            fn_log_warning "${0}: Interface '${IF_NAME}' exists after deletion"
+        fi
+    done
+}
+
+fn_install() {
+    fn_check_for_root || return 1
+
+    mkdir -p "$L2TOP_INSTALL_DIR" || {
+        fn_log_err "${0}: Failed to create the installation directory: '${L2TOP_INSTALL_DIR}'"
+        return 1
+    }
+
+    mkdir -p "$L2TOP_CONFIG_DIR" || {
+        fn_log_err "${0}: Failed to create the configuration directory: '${L2TOP_CONFIG_DIR}'"
+        return 1
+    }
+
+    cat <<EOF > "$L2TOP_CONFIG_DIR"/README
+# This is an example of L2TOP3 tunnel interface configuration file.
+# Note that the name of a configuration file must end with '.conf'.
+# Configuration files are just sourced by the /bin/sh shell.
+
+# IP version. Please select one.
+IP_VERSION=4
+#IP_VERSION=6
+
+# L2TP tunnel ID.
+TUNNEL_ID=1
+
+# Remote endpoint hostname or an IP address.
+REMOTE=some.hostname.example
+#REMOTE=127.0.0.1
+#REMOTE=::1
+
+# By default, file name before '.conf' becomes the interface name.
+# However, you can override that here.
+#IF_NAME=l2tp1
+
+# You can specify the MTU of the tunnel.
+# By default, 1500 is used.
+MTU=1500
+
+EOF
+    [ -f  "$L2TOP_CONFIG_DIR"/README ] || {
+        fn_log_err "${0}: Failed to install the sample configuration file"
+        return 1
+    }
+
+    cat "$0" > "$L2TOP_INSTALL_DIR"/l2top3 && chmod a+x "$L2TOP_INSTALL_DIR"/l2top3 || {
+        fn_log_err "${0}: Faild to install the l2top3 script: '${L2TOP_INSTALL_DIR}/l2top3'"
+        return 1
+    }
+
+    cat <<EOF > "$L2TOP_INSTALL_DIR"/l2top3.service
+[Unit]
+Description=L2TOP3 L2TPv3 script
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/
+ExecStart=${L2TOP_INSTALL_DIR}/l2top3 start
+ExecReload=${L2TOP_INSTALL_DIR}/l2top3 reload
+ExecStop=${L2TOP_INSTALL_DIR}/l2top3 stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    [ -f "$L2TOP_INSTALL_DIR"/l2top3.service ] || {
+        fn_log_err "${0}: Faild to install the l2top3 service file: '${L2TOP_INSTALL_DIR}/l2top3.service'"
+        return 1
+    }
+
+    ln -sf "$L2TOP_INSTALL_DIR"/l2top3.service /etc/systemd/system/ || {
+        fn_log_err "${0}: Failed to link the l2top3 systemd service file"
+        return 1
+    }
+
+    ln -sf "$L2TOP_INSTALL_DIR"/l2top3 /usr/local/bin/
+
+    systemctl daemon-reload
+    systemctl enable --now l2top3.service
+
+    echo "L2TOP3 is now installed!"
+    echo "Example configuration file is installed at: ${L2TOP_CONFIG_DIR}/README."
+    echo "For example, to create a tunnel interface named 'l2tp-test',"
+    echo "just create '${L2TOP_CONFIG_DIR}/l2tp-test.conf' appropriately."
+}
+
+# Check for the environment.
+"$L2TOP_IP_BIN" -V > /dev/null 2>&1 || fn_die "The 'ip' utility is not available."
+
+
+case "$1" in
+    start|reload)
+        fn_setup
+        ;;
+    install)
+        fn_install
+        ;;
+    stop)
+        fn_stop
+        ;;
+    *)
+        echo "Usage: $0 install|start|reload|stop"
+        ;;
+esac
