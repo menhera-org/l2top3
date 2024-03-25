@@ -376,6 +376,7 @@ fn_load_config() {
     unset TUNNEL_ID
     unset REMOTE
     unset MTU
+    unset HOOK
 
     . "$1"
 
@@ -438,6 +439,9 @@ fn_setup() {
         sleep 1
         fn_l2tp_add $ip_version_option --if-name "$IF_NAME" --tunnel-id "$TUNNEL_ID" --remote-addr "$remote_addr" || continue
         "$L2TOP_IP_BIN" link set "$IF_NAME" mtu "$MTU"
+        if [ -n "$HOOK "] ; then
+            sh -c "$HOOK"
+        fi
         fn_log_info "${0}: Tunnel interface '${IF_NAME}' (tunnel ID=${TUNNEL_ID}) created"
     done
     return 0
